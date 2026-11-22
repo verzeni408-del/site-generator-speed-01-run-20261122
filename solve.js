@@ -2,7 +2,13 @@
 // Own implementation of the same build, byte for byte, written for CPU time:
 // fused Markdown lex+render, chunked inline escaping (no per-character escape),
 // front matter parsed without splitting the whole body, fast word counting,
-// template rendering into one shared output array with prototype-chain scopes.
+// template precompile per case + render to one output array with
+// prototype-chain scopes.
+// v2 changes over v1: escapeHtml without a replace callback, template codegen
+// with direct single-segment scope reads and a combined escTxt, trimLine with
+// no copy when nothing trims, link resolution without copying dirParts per
+// link, page toc reuses the renderer's toc entries, card tag links cached
+// once per tag.
 // No network, no file, no clock, no randomness, no dependencies. Node 22 target.
 
 /** Code-unit order (never the locale's). */
@@ -10,12 +16,24 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 // ---------------------------------------------------------------- text
 
-const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESC_RE = /[&<>"']/g;
 
 /** `text` with & < > " and ' escaped. */
 function escapeHtml(text) {
-  return text.replace(ESC_RE, (c) => ESCAPES[c]);
+  ESC_RE.lastIndex = 0;
+  let m = ESC_RE.exec(text);
+  if (m === null) return text;
+  const out = [];
+  let run = 0;
+  do {
+    const i = m.index;
+    if (run < i) out.push(text.slice(run, i));
+    const c = text.charCodeAt(i);
+    out.push(c === 38 ? '&amp;' : c === 60 ? '&lt;' : c === 62 ? '&gt;' : c === 34 ? '&quot;' : '&#39;');
+    run = i + 1;
+  } while ((m = ESC_RE.exec(text)) !== null);
+  if (run < text.length) out.push(text.slice(run));
+  return out.join('');
 }
 
 const MARK_RE = /\p{M}/gu;
@@ -78,7 +96,7 @@ function isWSCode(c) {
 
 /** Whitespace table for wordsOf: WS_TABLE[c] is 1 for a JS-whitespace code unit. */
 const WS_TABLE = new Uint8Array(65536);
-for (let c = 0; c < 65536; c++) WS_TABLE[c] = isWSCode(c) ? 1 : 0;
+for (const [a, b] of [[9, 13], [32, 32], [160, 160], [5760, 5760], [8192, 8202], [8232, 8233], [8239, 8239], [8287, 8287], [12288, 12288], [65279, 65279]]) WS_TABLE.fill(1, a, b + 1);
 
 /** The words of a body: its runs of characters other than whitespace. */
 function wordsOf(text) {
@@ -260,13 +278,13 @@ function isBlank(line) {
   return true;
 }
 
-/** A line with spaces and tabs at either end dropped. */
+/** A line with spaces and tabs at either end dropped (the same string when there is nothing to drop). */
 function trimLine(line) {
   let a = 0;
   let b = line.length;
   while (a < b && (line.charCodeAt(a) === 32 || line.charCodeAt(a) === 9)) a++;
   while (b > a && (line.charCodeAt(b - 1) === 32 || line.charCodeAt(b - 1) === 9)) b--;
-  return line.slice(a, b);
+  return a === 0 && b === line.length ? line : line.slice(a, b);
 }
 
 /**
@@ -419,7 +437,6 @@ const WS_RE = /\s/;
 
 /** `s` rendered inline; `env.link(target)` is a link's href. */
 const JUMP_RE = /[\\`*[&<>"']/g;
-
 /**
  * Renders inline markup by jumping from one special character to the next
  * with a regex (plain runs are copied whole). The regex's lastIndex is set
@@ -507,6 +524,7 @@ function inline(s, env) {
 /**
  * `src` rendered: its HTML (each block on its own lines, a "\n" after the last),
  * its table of contents (every level 2 and 3 heading: level, id and its inline
+ * HTML), its excerpt (the first paragraph's inline HTML, or ""), and its word
  * HTML) and its excerpt (the first paragraph's inline HTML, or "").
  */
 function renderMarkdown(src, env) {
@@ -746,6 +764,15 @@ function textOf(v) {
   return '';
 }
 
+/** `textOf(v)` escaped: numbers and booleans never hold an escapable character. */
+function escTxt(v) {
+  if (typeof v === 'string') return escapeHtml(v);
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (Array.isArray(v)) return escapeHtml(v.map(textOf).join(', '));
+  return '';
+}
+
 /** Whether a value counts as true in an if: not undefined, null, false, "", 0 or an empty array. */
 function truthy(v) {
   if (Array.isArray(v)) return v.length > 0;
@@ -844,17 +871,20 @@ function compileTemplate(nodes, cacheable, F, C) {
   };
   let tmp = 0;
   let scopeDepth = 0;
+  // A one-segment path reads straight off the scope (prototype chain included),
+  // exactly as lookup does for it; longer paths still go through lookup.
+  const ref = (scopeVar, path) => (path.length === 1 ? `${scopeVar}[${JSON.stringify(path[0])}]` : `get(${scopeVar},P[${pid(path)}])`);
   const gen = (ns, scopeVar) => {
     let code = '';
     for (let ni = 0; ni < ns.length; ni++) {
       const n = ns[ni];
       if (n.kind === 'text') code += `O.push(${JSON.stringify(n.text)});\n`;
-      else if (n.kind === 'var') code += `O.push(esc(txt(get(${scopeVar},P[${pid(n.path)}]))));\n`;
-      else if (n.kind === 'raw') code += `O.push(txt(get(${scopeVar},P[${pid(n.path)}])));\n`;
+      else if (n.kind === 'var') code += `O.push(escTxt(${ref(scopeVar, n.path)}));\n`;
+      else if (n.kind === 'raw') code += `O.push(txt(${ref(scopeVar, n.path)}));\n`;
       else if (n.kind === 'if') {
         const cond = n.not
-          ? `!truthy(get(${scopeVar},P[${pid(n.path)}]))`
-          : `truthy(get(${scopeVar},P[${pid(n.path)}]))`;
+          ? `!truthy(${ref(scopeVar, n.path)})`
+          : `truthy(${ref(scopeVar, n.path)})`;
         code += `if (${cond}) {\n${gen(n.then, scopeVar)}}`;
         if (n.else !== null) code += ` else {\n${gen(n.else, scopeVar)}}`;
         code += `\n`;
@@ -863,7 +893,7 @@ function compileTemplate(nodes, cacheable, F, C) {
         const k = `_k${tmp}`;
         const sv = `S${++scopeDepth}`;
         tmp++;
-        code += `{var ${x}=get(${scopeVar},P[${pid(n.path)}]);if(Array.isArray(${x})){for(var ${k}=0;${k}<${x}.length;${k}++){var ${sv}=Object.create(${scopeVar});${sv}.${n.name}=${x}[${k}];${sv}.loop={index:${k}+1,first:${k}===0,last:${k}===${x}.length-1,length:${x}.length};\n${gen(n.body, sv)}}}}\n`;
+        code += `{var ${x}=${ref(scopeVar, n.path)};if(Array.isArray(${x})){for(var ${k}=0;${k}<${x}.length;${k}++){var ${sv}=Object.create(${scopeVar});${sv}.${n.name}=${x}[${k}];${sv}.loop={index:${k}+1,first:${k}===0,last:${k}===${x}.length-1,length:${x}.length};\n${gen(n.body, sv)}}}}\n`;
         scopeDepth--;
       } else if (n.kind === 'include') {
         if (cacheable.has(n.name)) code += `if(D<8)incC(C,F,${JSON.stringify(n.name)},${scopeVar},D+1,O);\n`;
@@ -874,10 +904,10 @@ function compileTemplate(nodes, cacheable, F, C) {
   };
   const body = gen(nodes, 'S');
   const factory = new Function(
-    'F', 'C', 'get', 'txt', 'truthy', 'esc', 'inc', 'incC', 'P',
+    'F', 'C', 'get', 'txt', 'truthy', 'escTxt', 'inc', 'incC', 'P',
     `return function(S,D,O){\n${body}}`,
   );
-  return factory(F, C, lookup, textOf, truthy, escapeHtml, tplInc, tplIncCached, paths);
+  return factory(F, C, lookup, textOf, truthy, escTxt, tplInc, tplIncCached, paths);
 }
 
 /**
@@ -1062,6 +1092,14 @@ function resolvePath(dirParts, rel) {
   return parts.join('/');
 }
 
+/** `resolvePath` without the copy: `rel` has no "..", no "//", no leading "." and no "/." segment, so it appends plainly. */
+function resolvePathFast(dirParts, dirPrefix, rel) {
+  if (rel.indexOf('..') === -1 && rel.indexOf('//') === -1 && rel.charCodeAt(0) !== 46 && rel.indexOf('/.') === -1) {
+    return dirPrefix + rel;
+  }
+  return resolvePath(dirParts, rel);
+}
+
 /** A page's link record as templates read it. */
 const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) });
 
@@ -1153,6 +1191,7 @@ function build(input) {
   for (let si = 0; si < kept.length; si++) {
     const s = kept[si];
     const dirParts = s.dirParts;
+    const dirPrefix = dirParts.length === 0 ? '' : dirParts.join('/') + '/';
     const srcPath = s.path;
     const env = {
       link: (target) => {
@@ -1160,7 +1199,7 @@ function build(input) {
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dirParts, rel);
+        const path = rel === '' ? null : resolvePathFast(dirParts, dirPrefix, rel);
         if (path !== null) {
           const page = bySource.get(path);
           if (page !== undefined) return `${page.url}${frag}`;
@@ -1209,6 +1248,7 @@ function build(input) {
       let tag = bySlug.get(slug);
       if (tag === undefined) {
         tag = { name, slug, url: `${base}/tags/${slug}/`, posts: [] };
+        tag.link = { name, slug, url: tag.url };
         bySlug.set(slug, tag);
       }
       tag.posts.push(p);
@@ -1242,14 +1282,14 @@ function build(input) {
       summary: s.data.summary ?? '',
       excerpt: s.excerpt,
       reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-      tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+      tags: s.tagRefs.map((t) => t.link ?? { name: t.name, slug: t.slug, url: t.url }),
     };
     s.card = card;
     s.page = {
       ...card,
       slug: s.slug,
       content: s.html,
-      toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+      toc: s.toc,
       newer: linkOf(s.newer ?? null),
       older: linkOf(s.older ?? null),
       is_post: s.post,
